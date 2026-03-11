@@ -5,6 +5,7 @@ import { closePopups, delay, findChrome, formatRut, saveScreenshot } from "../ut
 const BANK_URL = "https://banco.santander.cl/personas";
 type LoginContext = Page | Frame;
 type MovementAccount = { index: number; label: string; active: boolean };
+type TcTab = "por-facturar" | "facturados";
 
 function parseChileanAmount(value: string): number {
   const clean = value.replace(/[^0-9-]/g, "");
@@ -532,6 +533,192 @@ async function selectMovementAccount(page: Page, index: number): Promise<boolean
   return activeIndexRetry === index;
 }
 
+async function navigateToCreditCardSection(page: Page, debugLog: string[]): Promise<boolean> {
+  const clickedTarjetas = await page.evaluate(() => {
+    const byId = document.querySelector("#menu-uid-0420") as HTMLElement | null;
+    if (byId) {
+      byId.click();
+      return true;
+    }
+    const items = Array.from(document.querySelectorAll("button, a, span"));
+    for (const item of items) {
+      const text = (item as HTMLElement).innerText?.trim().toLowerCase() || "";
+      const rect = (item as HTMLElement).getBoundingClientRect();
+      if (rect.x > 280) continue;
+      if (text === "tarjetas" || text.includes("tarjetas")) {
+        (item as HTMLElement).click();
+        return true;
+      }
+    }
+    return false;
+  });
+  if (clickedTarjetas) {
+    debugLog.push("  Tarjetas menu opened");
+    await delay(1500);
+  }
+
+  const clickedMyCards = await page.evaluate(() => {
+    const selectors = ["#menu-uid-0421", "#menu-uid-042182"];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      el.click();
+      return true;
+    }
+
+    const items = Array.from(document.querySelectorAll("button, a, span, li"));
+    for (const item of items) {
+      const text = (item as HTMLElement).innerText?.trim().toLowerCase() || "";
+      const rect = (item as HTMLElement).getBoundingClientRect();
+      if (rect.x > 300) continue;
+      if (text.includes("mis tarjetas de crédito") || text.includes("mis tarjetas de credito")) {
+        (item as HTMLElement).click();
+        return true;
+      }
+    }
+    return false;
+  });
+  if (clickedMyCards) {
+    debugLog.push("  Opened 'Mis Tarjetas de Credito'");
+    await delay(3500);
+  }
+
+  const tcOpened = page.url().toLowerCase().includes("saldos_tc");
+  if (tcOpened) return true;
+
+  const clickedWidget = await page.evaluate(() => {
+    const selectors = [
+      "#tarjetas-creditos .movement",
+      "#tarjetas-creditos .container-hover .movement",
+      "#tarjetas-creditos .menu-popup .movement",
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) continue;
+      el.click();
+      return true;
+    }
+    return false;
+  });
+  if (clickedWidget) {
+    debugLog.push("  Opened TC movements from dashboard widget");
+    await delay(4000);
+  }
+
+  return page.url().toLowerCase().includes("saldos_tc");
+}
+
+async function clickTcTab(page: Page, tab: TcTab): Promise<boolean> {
+  const targetText = tab === "por-facturar" ? "movimientos por facturar" : "movimientos facturados";
+  const clicked = await page.evaluate((text: string) => {
+    const items = Array.from(document.querySelectorAll("button, a, div, span"));
+    for (const item of items) {
+      const content = (item as HTMLElement).innerText?.trim().toLowerCase() || "";
+      if (content !== text) continue;
+      (item as HTMLElement).click();
+      return true;
+    }
+    return false;
+  }, targetText);
+
+  if (!clicked) return false;
+  await delay(3000);
+  return true;
+}
+
+function isCreditCardCredit(description: string): boolean {
+  const text = description.toLowerCase();
+  return (
+    text.includes("abono") ||
+    text.includes("cancelado") ||
+    text.includes("nota de credito") ||
+    text.includes("nota de crédito") ||
+    text.includes("reverso") ||
+    /^pago\b/.test(text)
+  );
+}
+
+async function extractCreditCardMovements(page: Page, tab: TcTab): Promise<BankMovement[]> {
+  const raw = await page.evaluate(() => {
+    const table = Array.from(document.querySelectorAll("table"))
+      .find((t) => {
+        const headerText = Array.from(t.querySelectorAll("th"))
+          .map((th) => (th as HTMLElement).innerText?.trim().toLowerCase() || "")
+          .join("|");
+        return headerText.includes("fecha") && headerText.includes("detalle") && headerText.includes("monto");
+      });
+    if (!table) return [];
+
+    const headers = Array.from(table.querySelectorAll("th")).map((th) => (th as HTMLElement).innerText?.trim().toLowerCase() || "");
+    const dateIndex = headers.findIndex((h) => h.includes("fecha"));
+    const detailIndex = headers.findIndex((h) => h.includes("detalle") || h.includes("descrip") || h.includes("glosa"));
+    const cargoIndex = headers.findIndex((h) => h.includes("cargo"));
+    const abonoIndex = headers.findIndex((h) => h.includes("abono"));
+    const amountIndex = headers.findIndex((h) => h === "monto" || h.includes("importe"));
+
+    const rows = Array.from(table.querySelectorAll("tbody tr"));
+    let lastDate = "";
+    const out: Array<{ date: string; description: string; amount: string }> = [];
+
+    for (const row of rows) {
+      const cells = Array.from(row.querySelectorAll("td")).map((td) => (td as HTMLElement).innerText?.trim() || "");
+      if (cells.length < 2) continue;
+
+      const rawDate = dateIndex >= 0 ? (cells[dateIndex] || "") : "";
+      const hasDate = /^\d{1,2}[\/.\-]\d{1,2}([\/.\-]\d{2,4})?$/.test(rawDate);
+      const date = hasDate ? rawDate : lastDate;
+      if (!date) continue;
+      if (hasDate) lastDate = rawDate;
+
+      const description = detailIndex >= 0 ? (cells[detailIndex] || "") : "";
+
+      let amount = "";
+      if (cargoIndex >= 0 && cells[cargoIndex]) {
+        amount = `-${cells[cargoIndex]}`;
+      } else if (abonoIndex >= 0 && cells[abonoIndex]) {
+        amount = cells[abonoIndex];
+      } else if (amountIndex >= 0 && cells[amountIndex]) {
+        amount = cells[amountIndex];
+      }
+
+      if (!description || !amount) continue;
+      out.push({ date, description, amount });
+    }
+
+    return out;
+  });
+
+  const tag = tab === "por-facturar" ? "[TC Por Facturar]" : "[TC Facturados]";
+  const movements = raw.map((row) => {
+    const absAmount = Math.abs(parseChileanAmount(row.amount));
+    if (absAmount === 0) return null;
+
+    let amount = absAmount;
+    if (row.amount.includes("-")) {
+      amount = -absAmount;
+    } else if (row.amount.includes("+")) {
+      amount = absAmount;
+    } else {
+      amount = isCreditCardCredit(row.description) ? absAmount : -absAmount;
+    }
+
+    return {
+      date: normalizeMovementDate(row.date),
+      description: `${tag} ${row.description}`.trim(),
+      amount,
+      balance: 0,
+    } satisfies BankMovement;
+  }).filter((m): m is BankMovement => m !== null);
+
+  const seen = new Set<string>();
+  return movements.filter((movement) => {
+    const key = `${movement.date}|${movement.description}|${movement.amount}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 async function navigateToMovements(page: Page, debugLog: string[]): Promise<void> {
   const sidebarClicked = await page.evaluate(() => {
     const byId = document.querySelector("#menu-uid-0410") as HTMLElement | null;
@@ -913,6 +1100,38 @@ async function scrape(options: ScraperOptions): Promise<ScrapeResult> {
       const key = `${movement.date}|${movement.description}|${movement.amount}|${movement.balance}`;
       if (movementSeen.has(key)) return false;
       movementSeen.add(key);
+      return true;
+    });
+
+    debugLog.push("7b. Navigating to credit card movements...");
+    const tcReady = await navigateToCreditCardSection(page, debugLog);
+    if (!tcReady) {
+      debugLog.push("  Could not open credit card section.");
+    } else {
+      const tcPorFacturarOpened = await clickTcTab(page, "por-facturar");
+      if (tcPorFacturarOpened) {
+        const tcPorFacturar = await extractCreditCardMovements(page, "por-facturar");
+        movements.push(...tcPorFacturar);
+        debugLog.push(`  TC por facturar: ${tcPorFacturar.length} movement(s)`);
+      } else {
+        debugLog.push("  Could not open TC tab: Movimientos por facturar");
+      }
+
+      const tcFacturadosOpened = await clickTcTab(page, "facturados");
+      if (tcFacturadosOpened) {
+        const tcFacturados = await extractCreditCardMovements(page, "facturados");
+        movements.push(...tcFacturados);
+        debugLog.push(`  TC facturados: ${tcFacturados.length} movement(s)`);
+      } else {
+        debugLog.push("  Could not open TC tab: Movimientos facturados");
+      }
+    }
+
+    const finalSeen = new Set<string>();
+    movements = movements.filter((movement) => {
+      const key = `${movement.date}|${movement.description}|${movement.amount}|${movement.balance}`;
+      if (finalSeen.has(key)) return false;
+      finalSeen.add(key);
       return true;
     });
 

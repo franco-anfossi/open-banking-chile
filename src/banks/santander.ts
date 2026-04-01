@@ -1,6 +1,6 @@
 import type { Frame, Page } from "puppeteer-core";
-import type { BankMovement, BankScraper, ScrapeResult, ScraperOptions } from "../types.js";
-import { deduplicateMovements, closePopups, delay } from "../utils.js";
+import type { BankMovement, BankScraper, CreditCardBalance, ScrapeResult, ScraperOptions } from "../types.js";
+import { deduplicateMovements, closePopups, delay, parseChileanAmount } from "../utils.js";
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { fillRut, fillPassword, clickSubmit, detectLoginError } from "../actions/login.js";
@@ -41,6 +41,7 @@ const TWO_FACTOR_CONFIG = {
 // ─── Santander-specific helpers ──────────────────────────────────────
 
 type MovementAccount = { index: number; label: string };
+type CreditCardSlide = { index: number; label: string };
 
 async function getLoginFrame(page: Page): Promise<Frame | null> {
   const handle = await page.$("iframe#login-frame");
@@ -180,6 +181,212 @@ async function navigateToCreditCardSection(page: Page, debugLog: string[]): Prom
   return page.url().toLowerCase().includes("saldos_tc");
 }
 
+function formatCardLabel(cardName?: string, last4?: string): string {
+  const name = (cardName || "Tarjeta Santander").replace(/\s+/g, " ").trim();
+  if (!last4) return name;
+  if (name.includes(last4) || name.includes(`****${last4}`)) return name;
+  return `${name} ****${last4}`;
+}
+
+function parseUsdAmount(text?: string | null): number {
+  const clean = (text || "").replace(/[^0-9.,-]/g, "");
+  if (!clean) return 0;
+  const normalized = clean.replace(/\./g, "").replace(",", ".");
+  const amount = Number.parseFloat(normalized);
+  return Number.isNaN(amount) ? 0 : amount;
+}
+
+async function getActiveCreditCardSlideIndex(page: Page): Promise<number> {
+  return await page.evaluate(() => {
+    const slides = Array.from(document.querySelectorAll(".container-carusel .swiper-slide"));
+    return slides.findIndex((slide) => (slide as HTMLElement).className.includes("swiper-slide-active"));
+  });
+}
+
+async function listCreditCardSlides(page: Page): Promise<CreditCardSlide[]> {
+  const rawSlides = await page.evaluate(() => {
+    const slides = Array.from(document.querySelectorAll(".container-carusel .swiper-slide"));
+    return slides
+      .map((slide, index) => {
+        const text = (slide as HTMLElement).innerText?.replace(/\s+/g, " ").trim() || "";
+        if (!text) return null;
+
+        const cardName =
+          text.match(/^(.*?)\s+Cupo Disponible/i)?.[1]?.trim() ||
+          text.match(/^(.*?)\s+\$\s*[\d.,]+/i)?.[1]?.trim() ||
+          "";
+        const last4 = text.match(/\*\s*(\d{4})/)?.[1] || text.match(/(\d{4})(?!.*\d)/)?.[1] || "";
+        return { index, cardName, last4 };
+      })
+      .filter((slide): slide is { index: number; cardName: string; last4: string } => Boolean(slide));
+  });
+
+  return rawSlides.map((slide) => ({
+    index: slide.index,
+    label: formatCardLabel(slide.cardName, slide.last4),
+  }));
+}
+
+async function selectCreditCardSlide(page: Page, index: number): Promise<boolean> {
+  const clicked = await page.evaluate((targetIndex: number) => {
+    const byAria = document.querySelector(
+      `.container-carusel [aria-label='Go to slide ${targetIndex + 1}']`,
+    ) as HTMLElement | null;
+    if (byAria) {
+      byAria.click();
+      return true;
+    }
+
+    const dots = Array.from(document.querySelectorAll(".container-carusel .swiper-pagination-bullet"));
+    if (dots[targetIndex]) {
+      (dots[targetIndex] as HTMLElement).click();
+      return true;
+    }
+
+    const slides = Array.from(document.querySelectorAll(".container-carusel .swiper-slide"));
+    if (slides[targetIndex]) {
+      const slide = slides[targetIndex] as HTMLElement;
+      const clickable =
+        (slide.querySelector(".container-image, .container-tcr") as HTMLElement | null) ||
+        slide;
+      clickable.click();
+      return true;
+    }
+
+    return false;
+  }, index);
+
+  if (!clicked) return false;
+  await delay(1200);
+
+  if ((await getActiveCreditCardSlideIndex(page)) === index) return true;
+  await delay(1800);
+  return (await getActiveCreditCardSlideIndex(page)) === index;
+}
+
+async function extractActiveCreditCardMetadata(page: Page): Promise<CreditCardBalance | null> {
+  const raw = await page.evaluate(() => {
+    const normalizeText = (value?: string | null) => value?.replace(/\s+/g, " ").trim() || "";
+    const activeSlide = document.querySelector(
+      ".container-carusel .swiper-slide.swiper-slide-active",
+    ) as HTMLElement | null;
+    const slideText = normalizeText(activeSlide?.innerText);
+
+    const cardName =
+      slideText.match(/^(.*?)\s+Cupo Disponible/i)?.[1]?.trim() ||
+      slideText.match(/^(.*?)\s+\$\s*[\d.,]+/i)?.[1]?.trim() ||
+      "";
+    const last4 =
+      slideText.match(/\*\s*(\d{4})/)?.[1] ||
+      slideText.match(/(\d{4})(?!.*\d)/)?.[1] ||
+      "";
+
+    const sections = Array.from(
+      document.querySelectorAll(".card-detail .balance__container"),
+    ).map((section) => {
+      const header = normalizeText(
+        (section.querySelector(".header .big") as HTMLElement | null)?.innerText ||
+          (section.querySelector(".header") as HTMLElement | null)?.innerText,
+      );
+      const text = normalizeText((section as HTMLElement).innerText);
+      const available = text.match(/Disponible\s+(?:USD|\$)?\s*([\d.,]+)/i)?.[1] || null;
+      const used = text.match(/Utilizado\s+(?:USD|\$)?\s*([\d.,]+)/i)?.[1] || null;
+      const total = text.match(/Autorizado\s+(?:USD|\$)?\s*([\d.,]+)/i)?.[1] || null;
+      const currency = header.toLowerCase().includes("dólar") || header.toLowerCase().includes("dolar")
+        ? "USD"
+        : "CLP";
+
+      return { header, available, used, total, currency };
+    });
+
+    const bodyText = normalizeText(document.body?.innerText);
+    const billingPeriod =
+      bodyText.match(/Periodo de facturaci[oó]n\s+([^\n]+)/i)?.[1]?.trim() || null;
+    const nextBillingDate =
+      bodyText.match(
+        /Pr[oó]xima facturaci[oó]n\s+(\d{1,2}[\/.\-]\d{1,2}(?:[\/.\-]\d{2,4})?|\d{1,2}\s+[A-Za-záéíóúñ]+\s+\d{4})/i,
+      )?.[1] || null;
+
+    return { cardName, last4, sections, billingPeriod, nextBillingDate };
+  });
+
+  const label = formatCardLabel(raw.cardName, raw.last4);
+  const card: CreditCardBalance = { label };
+
+  for (const section of raw.sections) {
+    if (!section.available && !section.used && !section.total) continue;
+
+    if (section.currency === "USD") {
+      card.international = {
+        used: Math.abs(parseUsdAmount(section.used)),
+        available: parseUsdAmount(section.available),
+        total: parseUsdAmount(section.total),
+        currency: "USD",
+      };
+      continue;
+    }
+
+    card.national = {
+      used: Math.abs(parseChileanAmount(section.used || "0")),
+      available: parseChileanAmount(section.available || "0"),
+      total: parseChileanAmount(section.total || "0"),
+    };
+  }
+
+  if (!card.national && !card.international) return null;
+  if (raw.billingPeriod) card.billingPeriod = raw.billingPeriod;
+  if (raw.nextBillingDate) card.nextBillingDate = raw.nextBillingDate;
+  return card;
+}
+
+async function extractCreditCardMetadata(page: Page, debugLog: string[]): Promise<CreditCardBalance[]> {
+  const slides = await listCreditCardSlides(page);
+  const activeIndex = await getActiveCreditCardSlideIndex(page);
+  const seen = new Set<string>();
+  const creditCards: CreditCardBalance[] = [];
+
+  const captureCurrentSlide = async (slide: CreditCardSlide | null) => {
+    const metadata = await extractActiveCreditCardMetadata(page);
+    if (!metadata) return;
+
+    const key = `${metadata.label}|${metadata.national?.total ?? ""}|${metadata.international?.total ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    creditCards.push(metadata);
+
+    const national =
+      metadata.national
+        ? `CLP total=$${metadata.national.total.toLocaleString("es-CL")}, used=$${metadata.national.used.toLocaleString("es-CL")}, available=$${metadata.national.available.toLocaleString("es-CL")}`
+        : "sin cupo CLP";
+    const international =
+      metadata.international
+        ? `USD total=${metadata.international.total}, used=${metadata.international.used}, available=${metadata.international.available}`
+        : "sin cupo USD";
+
+    debugLog.push(`  TC metadata${slide ? ` [${slide.label}]` : ""}: ${national}; ${international}`);
+  };
+
+  if (slides.length === 0) {
+    await captureCurrentSlide(null);
+    return creditCards;
+  }
+
+  for (const slide of slides) {
+    const switched = slide.index === activeIndex || (await selectCreditCardSlide(page, slide.index));
+    if (!switched) {
+      debugLog.push(`  Could not switch to credit card slide ${slide.index + 1}: ${slide.label}`);
+      continue;
+    }
+    await captureCurrentSlide(slide);
+  }
+
+  if (activeIndex >= 0) {
+    await selectCreditCardSlide(page, activeIndex);
+  }
+
+  return creditCards;
+}
+
 // ─── Main scrape function ────────────────────────────────────────────
 
 async function scrapeSantander(
@@ -309,11 +516,30 @@ async function scrapeSantander(
   }
   movements = deduplicateMovements(movements);
 
+  let balance: number | undefined;
+  const withBalance = movements.find((m) => m.balance > 0);
+  if (withBalance) {
+    balance = withBalance.balance;
+    debugLog.push(`  Balance from account movements: $${balance.toLocaleString("es-CL")}`);
+  }
+  if (balance === undefined || balance === 0) {
+    balance = await extractBalance(page);
+    if (balance !== undefined) {
+      debugLog.push(`  Balance from account page: $${balance.toLocaleString("es-CL")}`);
+    }
+  }
+
   // 7b. Credit card movements
   debugLog.push("7b. Navigating to credit card movements...");
   progress("Extrayendo movimientos de tarjeta de crédito...");
+  let creditCards: CreditCardBalance[] | undefined;
   const tcReady = await navigateToCreditCardSection(page, debugLog);
   if (tcReady) {
+    const metadata = await extractCreditCardMetadata(page, debugLog);
+    if (metadata.length > 0) {
+      creditCards = metadata;
+    }
+
     if (await clickTcTab(page, "movimientos por facturar")) {
       const unbilled = await extractCreditCardMovements(page, "unbilled");
       movements.push(...unbilled);
@@ -329,17 +555,6 @@ async function scrapeSantander(
   }
   movements = deduplicateMovements(movements);
 
-  // 8. Balance
-  let balance: number | undefined;
-  const withBalance = movements.find((m) => m.balance > 0);
-  if (withBalance) {
-    balance = withBalance.balance;
-    debugLog.push(`  Balance from movements: $${balance.toLocaleString("es-CL")}`);
-  }
-  if (balance === undefined || balance === 0) {
-    balance = await extractBalance(page);
-  }
-
   debugLog.push(`8. Extracted ${movements.length} movement(s)`);
   progress(`Listo — ${movements.length} movimientos totales`);
   debugLog.push(balance !== undefined ? `9. Balance: $${balance.toLocaleString("es-CL")}` : "9. Balance not found");
@@ -347,7 +562,15 @@ async function scrapeSantander(
   await doSave(page, "05-final");
   const ss = doScreenshots ? ((await page.screenshot({ encoding: "base64", fullPage: true })) as string) : undefined;
 
-  return { success: true, bank, movements, balance, screenshot: ss, debug: debugLog.join("\n") };
+  return {
+    success: true,
+    bank,
+    movements,
+    balance,
+    creditCards: creditCards?.length ? creditCards : undefined,
+    screenshot: ss,
+    debug: debugLog.join("\n"),
+  };
 }
 
 // ─── Export ──────────────────────────────────────────────────────────
